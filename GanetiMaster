@@ -1,0 +1,284 @@
+#!/bin/sh
+#
+#   Resource Agent for managing Ganeti master role.
+#
+#   License:       GNU General Public License (GPL)
+#
+#   (c) 2010-2013  Giuseppe Paterno' <gpaterno@gpaterno.com>
+#                  Guido Trotter <ultrotter@google.com>
+#
+#
+# This resource agent will ensure that ganeti-masterd and
+# ganeti-rapi are running in the master node.
+#
+# Copy this on:
+# /usr/lib/ocf/resource.d/ganeti
+#
+#
+
+# Agent version
+VERSION="0.3"
+
+: ${OCF_ROOT=/usr/lib/ocf}
+# Load standard OCF functions
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/resource.d/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/.ocf-shellfuncs
+
+#/usr/lib/ganeti/daemon-util check-config
+
+## Adding in path Ganeti
+PATH=$PATH:/usr/lib/ganeti
+
+## Binaries
+DAEMON_UTIL="daemon-util"
+MASTERD="ganeti-masterd"
+CLUSTER_CLI="gnt-cluster"
+RAPI="ganeti-rapi"
+
+## Not using Ganeti's voting system
+## as pacemaker will take care of voting and quorum
+MASTERD_OPTIONS="--no-voting --yes-do-it"
+
+## Who am I
+HOSTNAME=$(hostname -f)
+
+## List of master candidates
+MASTER_CND_FILE="/var/lib/ganeti/ssconf_master_candidates"
+
+## RAPI endpoint
+RAPI_URL="https://localhost:5080/2/info"
+
+# Pre-flight checks
+ganeti_master_validate_all() {
+
+   # Check binaries
+   check_binary $DAEMON_UTIL
+   check_binary $MASTERD
+   check_binary $RAPI
+   check_binary $CLUSTER_CLI
+
+   # Check if I'm master/master-candidate
+   grep -Fx $HOSTNAME $MASTER_CND_FILE >/dev/null
+
+   if [ $? -ne 0 ] ; then
+       ocf_log err "$HOSTNAME is not Ganeti master neither master candidate"
+       return $OCF_ERR_INSTALLED
+   fi
+
+   return $OCF_SUCCESS
+
+}
+
+# Script usage :)
+ganeti_master_usage() {
+
+     cat << END
+usage: $0 action
+
+action:
+        start       : start Ganeti master role
+        stop        : stop Ganeti mater role
+        status      : return the status of Ganeti master daemon
+        monitor     : return if Ganeti Master daemon is working
+        meta-data   : show meta data message
+        validate-all: validate the instance parameters
+
+END
+
+     return $OCF_ERR_ARGS
+}
+
+# Return meta-data information
+ganeti_master_meta_data() {
+    cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="GanetiMaster">
+<version>$VERSION</version>
+
+<longdesc lang="en">
+OCF script to manage the ganeti master role in a cluster.
+Can be used to failover the ganeti master between master candidate nodes.
+</longdesc>
+
+<shortdesc lang="en">Manages the ganeti master role</shortdesc>
+
+<parameters>
+</parameters>
+
+<actions>
+<action name="start" timeout="60s" />
+<action name="stop" timeout="60s" />
+<action name="monitor" depth="0" timeout="20s" interval="30s" />
+<action name="meta-data" timeout="5s" />
+<action name="recover" timeout="20s" />
+<action name="reload" timeout="30s" />
+</actions>
+</resource-agent>
+END
+
+   return $OCF_SUCCESS
+}
+
+# Start Master
+ganeti_master_start() {
+   # exit immediately if configuration is not valid
+   ganeti_master_validate_all || exit $?
+
+   # Check if masterd is running and start if not
+   is_masterd_running
+
+   if [ $? -ne 0 ]
+   then
+
+      # Check who's the previous master
+      CUR_MASTER=$($CLUSTER_CLI getmaster)
+      ocf_log debug "Current master is $CUR_MASTER"
+
+      # Executing failover if we are not the master
+      if [ "x$CUR_MASTER" != "x$HOSTNAME" ] ; then
+          ocf_log info "$CUR_MASTER is no longer the master, taking over ..."
+          $CLUSTER_CLI master-failover $MASTERD_OPTIONS
+      else
+          # Start masterd
+          ocf_log info "Starting $MASTERD"
+          ocf_run $DAEMON_UTIL start $MASTERD $MASTERD_OPTIONS
+      fi
+
+      # Distribute configuration if I wasn't
+      # the previous master. I cannot guarantee
+      # the conf of a dead node
+      ocf_log info "Redistributing config in the Ganeti cluster ..."
+      $CLUSTER_CLI redist-conf
+
+      ## I should check the exit code
+      ## but masterd might fail activating IP  
+
+   fi
+
+   # Check if RAPI endpoint is running and start if not
+   is_rapi_running
+
+   if [ $? -ne 0 ] 
+   then
+
+       # Start RAPI
+       ocf_log info "Starting $RAPI"
+       ocf_run $DAEMON_UTIL start $RAPI || exit $OCF_ERR_GENERIC
+
+   fi
+
+   return $OCF_SUCCESS
+
+}
+
+# Stop Master
+ganeti_master_stop() {
+
+   # Stopping masterd
+   ocf_log info "Sopping $MASTERD"
+   ocf_run $DAEMON_UTIL stop $MASTERD
+
+   # Stopping RAPI
+   ocf_log info "Stopping $RAPI"
+   ocf_run $DAEMON_UTIL stop $RAPI
+
+   return $OCF_SUCCESS
+
+}
+
+## Check if RAPI is running
+is_rapi_running() {
+
+   curl -k $RAPI_URL >/dev/null 2>/dev/null
+    
+   if [ $? -ne 0 ] 
+   then
+      ocf_log info "RAPI endpoint not running." 
+      return $OCF_NOT_RUNNING
+   else
+      ocf_log info "RAPI endpoint running."
+      return $OCF_SUCCESS
+   fi
+
+}
+
+## Check if masterd is running
+is_masterd_running() {
+
+   $CLUSTER_CLI master-ping
+
+   if [ $? -ne 0 ] 
+   then
+      ocf_log info "Master daemon not running." 
+      return $OCF_NOT_RUNNING
+   else
+      ocf_log info "Master daemon running."
+      return $OCF_SUCCESS
+   fi
+
+}
+
+# Monitor masterd status
+ganeti_master_monitor() {
+
+   is_masterd_running
+   master_status=$?
+
+   is_rapi_running
+   rapi_status=$?
+
+   if [ $master_status -eq 0 -a $rapi_status -eq 0 ] 
+   then
+      ocf_log info "Ganeti master service is running"
+      return $OCF_SUCCESS
+   else
+      ocf_log info "Ganeti master service is not running"
+      return $OCF_NOT_RUNNING
+   fi
+
+}
+
+
+# Make sure meta-data and usage always succeed
+case $__OCF_ACTION in
+
+   meta-data)      ganeti_master_meta_data
+                   exit $OCF_SUCCESS
+                   ;;
+   usage|help)     ganeti_master_usage
+                   exit $OCF_SUCCESS
+                   ;;
+
+esac
+
+# Anything other than meta-data and usage must pass validation
+ganeti_master_validate_all || exit $?
+
+# Translate each action into the appropriate function call
+case $__OCF_ACTION in
+
+   start)          ganeti_master_start 
+                   ;;
+   stop)           ganeti_master_stop 
+                   ;;
+   status|monitor) ganeti_master_monitor 
+                   ;;
+   promote)        exit $OCF_SUCCESS 
+                   ;;
+   demote)         exit $OCF_SUCCESS 
+                   ;;
+   reload)         ocf_log info "Reloading Ganeti Master..."
+                   ganeti_master_start
+                   ;;
+   validate-all)   ;;
+   *)              ganeti_master_usage
+                   exit $OCF_ERR_UNIMPLEMENTED
+                   ;;
+
+esac
+rc=$?
+
+# Final debug
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION returned $rc"
+exit $rc
